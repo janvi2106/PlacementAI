@@ -4,7 +4,8 @@ import {
   signInWithEmailAndPassword, 
   createUserWithEmailAndPassword, 
   signInWithPopup, 
-  sendPasswordResetEmail 
+  sendPasswordResetEmail,
+  updateProfile
 } from 'firebase/auth';
 import { doc, setDoc } from 'firebase/firestore';
 import { auth, googleProvider, db } from '../firebase';
@@ -13,6 +14,7 @@ export default function AuthModal({ isOpen, onClose, onLoginSuccess }) {
   const [tab, setTab] = useState('login'); // 'login' | 'register' | 'forgot'
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
   const [fullName, setFullName] = useState('');
   const [message, setMessage] = useState('');
   const [errorMessage, setErrorMessage] = useState('');
@@ -31,6 +33,12 @@ export default function AuthModal({ isOpen, onClose, onLoginSuccess }) {
     e.preventDefault();
     setErrorMessage('');
     setMessage('');
+
+    if (tab === 'register' && password !== confirmPassword) {
+      setErrorMessage('Passwords do not match. Please verify your password.');
+      return;
+    }
+
     setLoading(true);
 
     try {
@@ -44,14 +52,33 @@ export default function AuthModal({ isOpen, onClose, onLoginSuccess }) {
       if (tab === 'register') {
         const userCredential = await createUserWithEmailAndPassword(auth, email, password);
         const user = userCredential.user;
-        await setDoc(doc(db, 'users', user.uid), {
-          uid: user.uid,
-          fullName: fullName || 'Placement User',
-          email: email,
-          createdAt: new Date().toISOString()
-        });
+
+        // Update display name in Firebase Auth
+        if (fullName) {
+          try {
+            await updateProfile(user, { displayName: fullName });
+          } catch (pErr) {
+            console.warn("Could not update profile display name:", pErr);
+          }
+        }
+
+        // Non-blocking Firestore record creation with 2.5s timeout
+        try {
+          await Promise.race([
+            setDoc(doc(db, 'users', user.uid), {
+              uid: user.uid,
+              fullName: fullName || 'Placement User',
+              email: email,
+              createdAt: new Date().toISOString()
+            }),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore timeout')), 2500))
+          ]);
+        } catch (dbErr) {
+          console.warn("Firestore user creation non-fatal error/timeout:", dbErr);
+        }
+
         onLoginSuccess({
-          name: fullName || user.email.split('@')[0],
+          name: fullName || user.displayName || user.email.split('@')[0],
           email: user.email,
           uid: user.uid
         });
@@ -68,13 +95,32 @@ export default function AuthModal({ isOpen, onClose, onLoginSuccess }) {
       }
     } catch (err) {
       console.error("Firebase Auth Error:", err);
-      let text = err.message || 'Authentication failed';
-      if (text.includes('auth/invalid-credential') || text.includes('auth/wrong-password')) {
-        text = 'Invalid email or password.';
-      } else if (text.includes('auth/email-already-in-use')) {
-        text = 'An account with this email already exists.';
-      } else if (text.includes('auth/weak-password')) {
-        text = 'Password should be at least 6 characters.';
+      let text = 'Authentication failed';
+      
+      switch (err.code) {
+        case 'auth/invalid-credential':
+        case 'auth/wrong-password':
+          text = 'Invalid email or password.';
+          break;
+        case 'auth/user-not-found':
+          text = 'No account found with this email.';
+          break;
+        case 'auth/email-already-in-use':
+          text = 'An account with this email already exists.';
+          break;
+        case 'auth/weak-password':
+          text = 'Password should be at least 6 characters.';
+          break;
+        case 'auth/invalid-email':
+          text = 'Please enter a valid email address.';
+          break;
+        default:
+          if (err.message) {
+            if (err.message.includes('auth/invalid-credential') || err.message.includes('auth/wrong-password')) text = 'Invalid email or password.';
+            else if (err.message.includes('auth/email-already-in-use')) text = 'An account with this email already exists.';
+            else if (err.message.includes('auth/weak-password')) text = 'Password should be at least 6 characters.';
+            else text = err.message;
+          }
       }
       setErrorMessage(text);
     } finally {
@@ -90,13 +136,22 @@ export default function AuthModal({ isOpen, onClose, onLoginSuccess }) {
         setLoading(true);
         const result = await signInWithPopup(auth, googleProvider);
         const user = result.user;
-        await setDoc(doc(db, 'users', user.uid), {
-          uid: user.uid,
-          fullName: user.displayName,
-          email: user.email,
-          photoURL: user.photoURL,
-          createdAt: new Date().toISOString()
-        }, { merge: true });
+
+        try {
+          await Promise.race([
+            setDoc(doc(db, 'users', user.uid), {
+              uid: user.uid,
+              fullName: user.displayName,
+              email: user.email,
+              photoURL: user.photoURL,
+              createdAt: new Date().toISOString()
+            }, { merge: true }),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore timeout')), 2500))
+          ]);
+        } catch (dbErr) {
+          console.warn("Firestore social login user creation non-fatal error/timeout:", dbErr);
+        }
+
         onLoginSuccess({
           name: user.displayName,
           email: user.email,
@@ -106,7 +161,15 @@ export default function AuthModal({ isOpen, onClose, onLoginSuccess }) {
         onClose();
       } catch (err) {
         console.error("Google Auth Error:", err);
-        setErrorMessage(err.message || 'Google sign-in failed');
+        let text = 'Google sign-in failed.';
+        if (err.code === 'auth/popup-closed-by-user') {
+          text = 'Sign-in popup was closed before completing.';
+        } else if (err.code === 'auth/popup-blocked') {
+          text = 'Sign-in popup was blocked by your browser. Please allow popups for this site.';
+        } else if (err.message) {
+          text = err.message;
+        }
+        setErrorMessage(text);
       } finally {
         setLoading(false);
       }
@@ -173,7 +236,12 @@ export default function AuthModal({ isOpen, onClose, onLoginSuccess }) {
             marginBottom: '20px'
           }}>
             <button
-              onClick={() => setTab('login')}
+              onClick={() => {
+                setTab('login');
+                setErrorMessage('');
+                setMessage('');
+                setConfirmPassword('');
+              }}
               style={{
                 flex: 1,
                 padding: '8px',
@@ -188,7 +256,12 @@ export default function AuthModal({ isOpen, onClose, onLoginSuccess }) {
               Sign In
             </button>
             <button
-              onClick={() => setTab('register')}
+              onClick={() => {
+                setTab('register');
+                setErrorMessage('');
+                setMessage('');
+                setConfirmPassword('');
+              }}
               style={{
                 flex: 1,
                 padding: '8px',
@@ -357,6 +430,37 @@ export default function AuthModal({ isOpen, onClose, onLoginSuccess }) {
                     Password Strength: {getPasswordStrength() < 50 ? 'Weak' : getPasswordStrength() < 80 ? 'Good' : 'Strong'}
                   </span>
                 </div>
+              )}
+            </div>
+          )}
+
+          {tab === 'register' && (
+            <div>
+              <label style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginBottom: '4px', display: 'block' }}>Confirm Password</label>
+              <div style={{ position: 'relative' }}>
+                <Lock size={16} color="var(--text-muted)" style={{ position: 'absolute', left: '12px', top: '12px' }} />
+                <input
+                  type="password"
+                  required
+                  placeholder="••••••••"
+                  value={confirmPassword}
+                  onChange={(e) => setConfirmPassword(e.target.value)}
+                  style={{
+                    width: '100%',
+                    padding: '10px 12px 10px 38px',
+                    background: 'rgba(255, 255, 255, 0.05)',
+                    border: password && confirmPassword && password !== confirmPassword ? '1px solid var(--accent-rose)' : '1px solid var(--border-color)',
+                    borderRadius: 'var(--radius-md)',
+                    color: 'var(--text-main)',
+                    fontSize: '0.88rem',
+                    outline: 'none'
+                  }}
+                />
+              </div>
+              {confirmPassword.length > 0 && password !== confirmPassword && (
+                <span style={{ fontSize: '0.7rem', color: 'var(--accent-rose)', marginTop: '4px', display: 'block' }}>
+                  Passwords do not match
+                </span>
               )}
             </div>
           )}
